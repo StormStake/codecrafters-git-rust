@@ -5,6 +5,9 @@ use std::fs;
 use std::io;
 use std::io::BufRead;
 use std::io::Read;
+use std::io::Write;
+use sha1::Digest;
+use sha1::Sha1;
 use clap::Subcommand;
 use clap::Parser;
 
@@ -32,7 +35,12 @@ enum Command
         #[clap(long, short)]
         pretty_print: bool,
         object_sha: String
-    }
+    },
+    HashObject {
+        #[clap(long, short)]
+        write: bool,
+        file: String
+    }  
 }
 
 fn main() {
@@ -70,6 +78,45 @@ fn main() {
             let mut object_data = vec![0; nfile_bytes];
             zreader.read_exact(&mut object_data).expect(&format!("Failed to read {} bytes",nfile_bytes));
             print!("{}", String::from_utf8(object_data).expect("Failed to parse file data"));
+        }
+        Command::HashObject { write, file } => {
+
+            let mut object_data = fs::read(file).expect("Failed reading file");
+
+            let size = object_data.len();
+            
+            let size_repr = size.to_string();
+            
+            let mut block: Vec<u8> = vec![];
+            block.append(&mut "blob ".as_bytes().to_vec());
+            block.append(&mut size_repr.into_bytes());
+            block.push(0);
+            block.append(&mut object_data);
+
+            let mut hasher = Sha1::new();
+            hasher.update(block.clone());
+            let res = hasher.finalize();
+            let mut object_sha = "".to_string();
+
+            for byte in res {
+                print!("{byte:02x?}");
+                object_sha += &format!("{byte:02x?}");
+            }
+            println!("");
+
+
+            
+            if write {
+                fs::create_dir(format!(".git/objects/{}",&object_sha[..2]));
+                let file = fs::File::create(format!("./.git/objects/{}/{}", &object_sha[..2],&object_sha[2..])).expect("Failed to open file");
+                let mut zwriter = flate2::write::ZlibEncoder::new(file,flate2::Compression::new(1));
+                let n = zwriter.write_all(&block).expect("Failed to write to file");
+
+
+
+            }
+            
+
         }
     }
     // Uncomment this block to pass the first stage
