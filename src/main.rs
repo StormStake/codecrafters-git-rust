@@ -44,6 +44,13 @@ enum Command {
         file: String,
     },
     WriteTree {},
+    CommitTree {
+        tree_sha: String,
+        #[clap(short)]
+        parent_sha: String,
+        #[clap(long, short)]
+        message: String,
+    },
 }
 
 fn main() {
@@ -207,7 +214,64 @@ fn main() {
             }
             println!("");
         }
+        Command::CommitTree {
+            tree_sha,
+            parent_sha,
+            message,
+        } => {
+            // println!("Tree: {tree_sha}");
+            // println!("Parent: {parent_sha}");
+            // println!("Message: {message}");
+            write_commit(tree_sha, parent_sha, message);
+        }
     }
+}
+
+fn write_commit(tree: String, parent: String, message: String) -> String {
+    let tree_line = format!("tree {tree}\n");
+    let parent_line = format!("parent {parent}\n");
+    let author_line = format!("author Aaron <email.email@gmail.com> 10 -0500\n");
+    let commiter_line =
+        format!("committer aaron <aaron@localhost.localdomain> 1727570086 -0500\n\n");
+    let message = format!("{message}");
+    let len = tree_line.len()
+        + parent_line.len()
+        + author_line.len()
+        + commiter_line.len()
+        + message.len();
+    let len = len.to_string();
+
+    let content = format!("{tree_line}{parent_line}{author_line}{commiter_line}{message}\n");
+
+    let mut commit_bytes = format!("commit {len}").to_string().into_bytes();
+    commit_bytes.push(0);
+    let mut content_bytes = content.into_bytes();
+    commit_bytes.append(&mut content_bytes);
+
+    let mut hasher = Sha1::new();
+
+    hasher.update(commit_bytes.clone());
+    let res = hasher.finalize();
+    let mut object_sha = "".to_string();
+    let mut hash = vec![];
+    for byte in res {
+        hash.push(byte);
+        object_sha += &format!("{byte:02x?}");
+    }
+
+    let _ = fs::create_dir(format!(".git/objects/{}", &object_sha[..2]));
+    let file = fs::File::create(format!(
+        "./.git/objects/{}/{}",
+        &object_sha[..2],
+        &object_sha[2..]
+    ))
+    .expect("Failed to open file");
+    let mut zwriter = flate2::write::ZlibEncoder::new(file, flate2::Compression::new(1));
+    let _n = zwriter
+        .write_all(&commit_bytes)
+        .expect("Failed to write to file");
+    println!("{object_sha}");
+    object_sha
 }
 
 fn write_blob(file: PathBuf, write: bool) -> Vec<u8> {
@@ -315,7 +379,7 @@ fn write_tree(path: PathBuf, write: bool) -> Vec<u8> {
             &object_sha[2..]
         ))
         .expect("Failed to open file");
-        eprintln!("Wrote file {:?}",object_sha);
+        eprintln!("Wrote file {:?}", object_sha);
         let mut zwriter = flate2::write::ZlibEncoder::new(file, flate2::Compression::new(1));
         let _n = zwriter.write_all(&object).expect("Failed to write to file");
     };
