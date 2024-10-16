@@ -13,7 +13,6 @@ use std::io::BufRead;
 use std::io::Read;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
 use std::path::PathBuf;
 
 mod dewey;
@@ -59,11 +58,12 @@ enum Command {
     },
     Clone {
         url: String,
+        directory: String,
     },
 }
 
 fn init(mut filepath: PathBuf) {
-    fs::create_dir(filepath.clone()).unwrap();
+    let _ = fs::create_dir(filepath.clone());
     filepath.push(".git");
     fs::create_dir(&filepath).unwrap();
     let mut objects_path = filepath.clone();
@@ -246,24 +246,45 @@ fn main() {
             // println!("Message: {message}");
             write_commit(tree_sha, parent_sha, message);
         }
-        Command::Clone { url } => {
+        Command::Clone { url, directory } => {
             let (main, items) = clone(url.clone());
             println!("HEAD should be {main}");
-            let mut repo_name = (url).split("/").last().unwrap();
-            repo_name = repo_name.strip_suffix(".git").unwrap_or(repo_name);
+            let repo_name = &directory;
+            //let mut repo_name = (url).split("/").last().unwrap();
+            //repo_name = repo_name.strip_suffix(".git").unwrap_or(repo_name);
+
             init(repo_name.into());
-            for (_, object_sha, data) in items.values() {
+            for (obj_type, object_sha, data) in items.values() {
                 let _ = fs::create_dir(format!("{repo_name}/.git/objects/{}", &object_sha[..2]));
 
                 let file = fs::File::create(format!(
                     "{repo_name}/.git/objects/{}/{}",
                     &object_sha[..2],
                     &object_sha[2..]
-                )).unwrap();
+                ))
+                .unwrap();
                 let mut zwriter =
                     flate2::write::ZlibEncoder::new(file, flate2::Compression::new(1));
-                let _n = zwriter.write_all(&data).expect("Failed to write to file");
+                let mut type_header: Vec<u8> = match obj_type {
+                    ObjectType::Commit => "commit ",
+                    ObjectType::Blob => "blob ",
+                    ObjectType::Tag => "tag ",
+                    ObjectType::Tree => "tree ",
+                }
+                .bytes()
+                .collect();
+                type_header.append(&mut (data.len().to_string().bytes().collect()));
+                type_header.push(0);
+                type_header.append(&mut data.clone());
+                let _n = zwriter
+                    .write_all(&type_header)
+                    .expect("Failed to write to file");
             }
+            std::env::set_current_dir(directory).unwrap();
+
+            let tree = get_tree_from_commit(&main);
+
+            tree_to_disk(tree, "".to_string(), None);
         }
         Command::Debug {} => {
             let delta_buf = fs::read("./test.delta").unwrap();
@@ -273,6 +294,31 @@ fn main() {
             println!("{new:?}");
         }
     }
+}
+
+fn get_tree_from_commit(sha: &str) -> String {
+    let file_data = fs::read(format!("./.git/objects/{}/{}", &sha[..2], &sha[2..]))
+        .expect("Failed to open file");
+
+    let z = flate2::read::ZlibDecoder::new(&file_data[..]);
+    let mut object_header = vec![];
+    let mut zreader = io::BufReader::new(z);
+
+    let _n = zreader
+        .read_until(0, &mut object_header)
+        .expect("Failed to read null byte");
+
+    let _header = String::from_utf8(object_header).expect("Failed to read utf-8");
+
+    let mut meta_data = vec![];
+    if let Err(_n) = zreader.read_until(b'\n', &mut meta_data) {
+        panic!();
+    };
+    meta_data.pop().unwrap();
+
+    let tree = String::from_utf8(meta_data).unwrap();
+    let name = tree.split_ascii_whitespace().last().unwrap();
+    name.to_string()
 }
 
 fn write_commit(tree: String, parent: String, message: String) -> String {
@@ -348,12 +394,16 @@ fn write_blob(file: PathBuf, write: bool) -> Vec<u8> {
 
     if write {
         let _ = fs::create_dir(format!(".git/objects/{}", &object_sha[..2]));
+        
         let file = fs::File::create(format!(
             "./.git/objects/{}/{}",
             &object_sha[..2],
             &object_sha[2..]
         ))
         .expect("Failed to open file");
+
+
+
         let mut zwriter = flate2::write::ZlibEncoder::new(file, flate2::Compression::new(1));
         let _n = zwriter.write_all(&block).expect("Failed to write to file");
     }
@@ -439,6 +489,80 @@ fn write_tree(path: PathBuf, write: bool) -> Vec<u8> {
     preface.push(b'\0');
     preface.append(&mut hash);
     preface
+}
+
+fn tree_to_disk(sha: String, mode: String, name: Option<String>) {
+    println!("Creating {} with name {:?}", sha, name);
+    let file_data = fs::read(format!("./.git/objects/{}/{}", &sha[..2], &sha[2..]))
+        .expect("Failed to open file");
+
+    if name.is_some() {
+        fs::create_dir(name.clone().unwrap()).unwrap();
+    }
+
+    let z = flate2::read::ZlibDecoder::new(&file_data[..]);
+    let mut object_header = vec![];
+    let mut zreader = io::BufReader::new(z);
+
+    let _n = zreader
+        .read_until(0, &mut object_header)
+        .expect("Failed to read null byte");
+
+    let _header = String::from_utf8(object_header).expect("Failed to read utf-8");
+    loop {
+        let mut meta_data = vec![];
+        if let Err(_n) = zreader.read_until(b'\0', &mut meta_data) {
+            break;
+        };
+        if meta_data.len() == 0 {
+            break;
+        }
+        meta_data.pop().unwrap();
+
+        let meta = String::from_utf8(meta_data).unwrap();
+
+        let mut meta_split = meta.split(" ");
+        let object_mode = meta_split.next().expect("Failed to find mode");
+        let object_name = meta_split.next().expect("Failed to find name");
+
+        let mut sha_data = vec![0; 20];
+        let _ = zreader.read_exact(&mut sha_data);
+        let mut sha_hex = "".to_string();
+        for byte in sha_data {
+            sha_hex += &format!("{:02x}", byte);
+        }
+        let child = match name {
+            None => object_name.to_string(),
+            Some(ref root) => format!("{}/{}", root, object_name),
+        };
+        if object_mode.starts_with("40000") {
+            tree_to_disk(sha_hex, object_mode.to_string(), Some(child.to_string()));
+        } else {
+            blob_to_disk(sha_hex, object_mode.to_string(), child);
+        }
+    }
+}
+
+fn blob_to_disk(sha: String, mode: String, path: String) {
+
+
+let file_data = fs::read(format!("./.git/objects/{}/{}", &sha[..2], &sha[2..]))
+        .expect("Failed to open file");
+
+    let z = flate2::read::ZlibDecoder::new(&file_data[..]);
+    let mut object_header = vec![];
+    let mut zreader = io::BufReader::new(z);
+
+    let _n = zreader
+        .read_until(0, &mut object_header)
+        .expect("Failed to read null byte");
+
+    let _header = String::from_utf8(object_header).expect("Failed to read utf-8");
+
+    let mut buffer = vec![];
+    zreader.read_to_end(&mut buffer).unwrap();
+    fs::write(path, buffer).unwrap();
+
 }
 
 fn clone(url: String) -> (String, HashMap<usize, (ObjectType, String, Vec<u8>)>) {
@@ -663,7 +787,7 @@ fn parse_pack(pack_data: Vec<u8>) -> HashMap<usize, (ObjectType, String, Vec<u8>
         // Returning the rest of the iterator
         pack_data = zlib.into_inner().to_vec().into_iter();
         match item_type {
-            1..5 => {
+            1..=4 => {
                 // Add extra length of object for length header
                 in_c += n;
 
